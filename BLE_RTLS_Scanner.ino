@@ -133,6 +133,7 @@ void connectServer()
 	while (!client.connect(server, port))
 	{
 		Serial.println("Tring to connect to the Server . . ");
+		client.connect(server, port);
 		FreeRTOS::sleep(1000);
 	}
 	Serial.println("Connected to the server : Success");
