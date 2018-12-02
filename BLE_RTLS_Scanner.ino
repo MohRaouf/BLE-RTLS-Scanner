@@ -28,7 +28,7 @@ char beaconAddress[20];			     // Char array to store the Curren MAC
 char beaconsPackets[20][100];        // 2D Char array to store the Packet with the MAC and RSSI Values
 int AddressesCount = 0;			     // Counter to Track the Founded Beacons
 bool deviceFound = false;		     // Flag to detect if the Device is found 
-char theReaderName[4] = ",R1";
+char theReaderName[4] = ",R2";
 bool serverConnectedForFirstTime = false;
 //flags for the Wifi and Server Connection
 bool wifiConnected = false;     
@@ -220,12 +220,13 @@ StartHere:
 		{
 			checkConnection();
 			printf("Tick! - still alive\n");
-			FreeRTOS::sleep(1000);
+			//delay(1000);
 		}
 		else
 		{
 			goto StartHere;
 		}
+		FreeRTOS::sleep(1000);
 	}
 	printf("Scanning sample ended\n");
 }
