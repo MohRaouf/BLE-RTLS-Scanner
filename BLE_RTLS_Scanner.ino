@@ -11,14 +11,20 @@ to the Server
 #include "BLEDevice.h"
 #include "BLEAdvertisedDevice.h"
 #include "sdkconfig.h"
-
-bool scanEnded = false;
+#include <esp_int_wdt.h>
+#include <esp_task_wdt.h>
 int rssi;
 
 char ssid[] = "RPI";		         //  your network SSID (name)
 char pass[] = "helphelp";		     // your network password
 int status = WL_IDLE_STATUS;
+
+IPAddress local_IP(192, 168, 137, 20); // Set your Static IP address
+IPAddress gateway(192, 168, 137, 1);   // Set your Gateway IP address
+IPAddress subnet(255, 255, 255, 0);    // Set your Subnet mask address
+
 IPAddress server(192, 168, 137, 1);  // The Server IP
+
 char localIPString[16];
 int port = 1234;                     // Port to send the data
 WiFiClient client;                   // initialize the WiFi Client to connect and send to the Server
@@ -28,11 +34,13 @@ char beaconAddress[20];			     // Char array to store the Curren MAC
 char beaconsPackets[20][100];        // 2D Char array to store the Packet with the MAC and RSSI Values
 int AddressesCount = 0;			     // Counter to Track the Founded Beacons
 bool deviceFound = false;		     // Flag to detect if the Device is found 
-char theReaderName[4] = ",R2";
+char theReaderName[4] = ",R1";
 bool serverConnectedForFirstTime = false;
 //flags for the Wifi and Server Connection
-bool wifiConnected = false;     
-bool serverConnected = false; 
+bool wifiConnected = false;
+bool serverConnected = false;
+hw_timer_t *periodicReboot = NULL;
+long loopTime = 0;
 
 // This Function to check the WiFi and Server connection and send the Packet or set the flags false
 void checkAndSend(char sendPacket[])
@@ -46,13 +54,11 @@ void checkAndSend(char sendPacket[])
 		}
 		else
 		{
-			printf("The Server Disconnected, Waiting for the Server to go online . . !  \n");
 			serverConnected = false;
 		}
 	}
 	else
 	{
-		printf("Not Connected to a WiFi Network . . . Tring To connect again . . !  \n");
 		wifiConnected = false;
 	}
 }
@@ -62,12 +68,18 @@ void connectWifi()
 {
 	while (WiFi.status() != WL_CONNECTED)
 	{
-		Serial.print("Attempting to connect to WPA SSID: ");
+		Serial.print(" \nAttempting to connect to WPA SSID: ");
 		Serial.println(ssid);
-		// Connect to WPA/WPA2 network:
-		status = WiFi.begin(ssid, pass);
-		// wait 3 seconds for connection:
-		delay(3000);
+		//Connect to WPA/WPA2 network:
+		status = !WiFi.config(local_IP, gateway, subnet);
+		//wait 3 seconds for connection:
+		//delay(3000);
+		FreeRTOS::sleep(3000);
+		if ((millis() - loopTime > 30000) && (WiFi.status() != WL_CONNECTED))
+		{
+			loopTime = millis();
+			interruptReboot();
+		}
 	}
 	strcpy(localIPString, WiFi.localIP().toString().c_str());
 	Serial.println(WiFi.localIP());
@@ -92,10 +104,14 @@ void connectServer()
 				{
 					serverConnectedForFirstTime = true;
 				}
+				if ((millis() - loopTime > 30000) && !serverConnectedForFirstTime)
+				{
+					loopTime = millis();
+					interruptReboot();
+				}
 			}
-			else 
+			else
 			{
-				printf("The server disconnected  . . the ESP will restart to connect again .!  \n");
 				ESP.restart();
 			}
 		}
@@ -104,25 +120,28 @@ void connectServer()
 			connectWifi();
 		}
 	}
-
-	Serial.println("Connected to the server : Success  \n");
 	serverConnected = true;
 	client.write(strcat(localIPString, theReaderName));
 	printf(strcat(localIPString, theReaderName));
 }
 //check connection function must be executed in the main thread not in the scan callback
 //to avoid Core panic and reboot 
-void checkConnection()
+bool checkConnection()
 {
 	if (!wifiConnected)
 	{
 		connectWifi();
+		return false;
 	}
 	else
 	{
-		if (!serverConnected)
+		if (!serverConnected || !client.connected())
 		{
 			connectServer();
+			return false;
+		}
+		else {
+			return true;
 		}
 	}
 }
@@ -153,9 +172,8 @@ class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks
 						//printf("Founded Beacons : %d\n", AddressesCount);
 						strcat(beaconsPackets[i], theReaderName);
 						checkAndSend(beaconsPackets[i]);
-						printf(">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> Packet Sent \n");
+						printf("\n>>>>>>>>>>>>>>>>>>>>>> Packet Sent \n");
 						printf(beaconsPackets[i]);
-						printf("\n");
 						strcpy(beaconsPackets[i], beaconAddress);
 					}
 					break;
@@ -167,7 +185,7 @@ class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks
 			}
 			if (!deviceFound)
 			{
-				printf(">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> Device Added \n");
+				printf("\n>>>>>>>>>>>>>>>>>>>>>>> Device Added \n");
 				strcpy(beaconsPackets[AddressesCount], beaconAddress);
 				AddressesCount++;
 			}
@@ -181,15 +199,48 @@ class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks
 */
 static void scanCompleteCB(BLEScanResults scanResults)
 {
-	scanEnded = true;
 	printf("Scan complete!\n");
 	AddressesCount = scanResults.getCount(); //Correction for the AddessesCount number //known Error//
 	printf("We found %d devices\n", AddressesCount);
 	scanResults.dump();
 } // scanCompleteCB
 
+//the watchdog timer interrupt function 
+TaskHandle_t Core0WdtHandle;
+hw_timer_t *core0Wdt = NULL;
+void Core0WDT(void * parameter)
+{
+	core0Wdt = timerBegin(0, 80, true);
+	timerAlarmWrite(core0Wdt, 3000000, false);
+	timerAttachInterrupt(core0Wdt, &interruptReboot, true);
+	timerAlarmEnable(core0Wdt);
+
+	while (true)
+	{
+		timerWrite(core0Wdt, 0); // reset the Watchdog timer
+		vTaskDelay(1000);
+	}
+}
+
 void setup()
 {
+	periodicReboot = timerBegin(0, 80, true);
+	timerAlarmWrite(periodicReboot, 300000000, false);
+	timerAttachInterrupt(periodicReboot, &interruptReboot, true);
+	timerAlarmEnable(periodicReboot);
+	loopTime = millis();
+
+	//fire a Watchdog timer on Core0 with a interrupt function
+	//to fix the issue of hanging the code when the default wdt triggered
+	xTaskCreatePinnedToCore(
+		Core0WDT, /* Function to implement the task */
+		"Core0WatchdogTimer", /* Name of the task */
+		10000,  /* Stack size in words */
+		NULL,  /* Task input parameter */
+		0,  /* Priority of the task */
+		&Core0WdtHandle,  /* Task handle. */
+		0); /* Core where the task should run */
+
 	Serial.begin(115200);
 	status = WiFi.begin(ssid, pass);
 	// attempt to connect to Wifi network:
@@ -197,41 +248,28 @@ void setup()
 	connectServer();
 }
 
-/**
-* Run the sample.
-*/
-static void run()
+void loop()
 {
-	printf("Async Scanning sample starting\n");
+	printf("\nAsync Scanning sample starting\n");
 	BLEDevice::init("");
 	BLEScan *pBLEScan = BLEDevice::getScan();
 	pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks(), true);
 	pBLEScan->setActiveScan(true);
-StartHere:
-	printf("About to start scanning for 60 seconds\n");
-	scanEnded = false;
-	pBLEScan->start(60, scanCompleteCB);
+	printf("\nAbout to start scanning forever seconds\n");
+	pBLEScan->start(0, scanCompleteCB);
 	//
 	// you can consider this loop as the main Thread
 	//
 	while (1)
 	{
-		if (!scanEnded)
-		{
-			checkConnection();
-			printf("Tick! - still alive\n");
-			//delay(1000);
-		}
-		else
-		{
-			goto StartHere;
-		}
+		checkConnection();
+		printf("\nTick! - still alive");
 		FreeRTOS::sleep(1000);
 	}
-	printf("Scanning sample ended\n");
-}
-
-void loop()
-{
-	run();
 } // app_main
+void interruptReboot()
+{
+	esp_task_wdt_init(1, true);
+	esp_task_wdt_add(NULL);
+	while (true);
+}
